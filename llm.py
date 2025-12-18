@@ -76,7 +76,7 @@ async def get_sql_from_llm(user_query: str) -> str | None:
         return None
 
     try:
-        model = genai.GenerativeModel('gemini-pro')
+        model = genai.GenerativeModel('gemini-2.5-flash')
         
         schema = get_schema()
         if not schema:
