@@ -6,6 +6,7 @@ import time
 import asyncio
 from collections import deque
 from functools import wraps
+from google.api_core.exceptions import ResourceExhausted
 
 load_dotenv()
 
@@ -100,13 +101,16 @@ def get_schema():
         logger.error("Файл схемы 'sql/init.sql' не найден.")
         return ""
 
-@rate_limit(5, 60)
-async def get_sql_from_llm(user_query: str) -> str | None:
+@rate_limit(20, 60)
+async def get_sql_from_llm(user_query: str, max_retries: int = 3, initial_backoff: float = 5.0) -> str | None:
     """
     Функция отправляет запрос к Gemini для преобразования текста в SQL.
+    Включает механизм повторных попыток с экспоненциальной задержкой.
 
     Args:
         user_query (str): Запрос пользователя на естественном языке.
+        max_retries (int): Максимальное количество повторных попыток.
+        initial_backoff (float): Начальное время ожидания в секундах.
 
     Returns:
         str | None: Сгенерированный SQL-запрос или None в случае ошибки.
@@ -115,27 +119,42 @@ async def get_sql_from_llm(user_query: str) -> str | None:
         logger.error("API-ключ для Gemini не найден. Проверьте .env файл.")
         return None
 
-    try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        
-        schema = get_schema()
-        if not schema:
-            return None
+    attempt = 0
+    backoff = initial_backoff
+    while attempt <= max_retries:
+        try:
+            model = genai.GenerativeModel('gemini-2.5-flash')
             
-        prompt = PROMPT_TEMPLATE.format(schema=schema, user_query=user_query)
-        
-        response = await model.generate_content_async(prompt)
-        
-        sql_query = response.text.strip()
-        if sql_query.lower().startswith("```sql"):
-            sql_query = sql_query[5:]
-        if sql_query.endswith("```"):
-            sql_query = sql_query[:-3]
-        if sql_query.endswith(';'):
-            sql_query = sql_query[:-1]
+            schema = get_schema()
+            if not schema:
+                return None
+                
+            prompt = PROMPT_TEMPLATE.format(schema=schema, user_query=user_query)
+            
+            response = await model.generate_content_async(prompt)
+            
+            sql_query = response.text.strip()
+            if sql_query.lower().startswith("```sql"):
+                sql_query = sql_query[5:]
+            if sql_query.endswith("```"):
+                sql_query = sql_query[:-3]
+            if sql_query.endswith(';'):
+                sql_query = sql_query[:-1]
 
-        return sql_query.strip()
+            return sql_query.strip()
 
-    except Exception as e:
-        logger.error(f"Ошибка при взаимодействии с Gemini API: {e}", exc_info=True)
-        return None
+        except ResourceExhausted as e:
+            if attempt == max_retries:
+                logger.error(f"Достигнуто максимальное количество повторных попыток. Ошибка API: {e}", exc_info=True)
+                return None
+            
+            logger.warning(f"Превышена квота API. Попытка {attempt + 1} из {max_retries}. Ожидание {backoff:.2f} сек.")
+            await asyncio.sleep(backoff)
+            attempt += 1
+            backoff *= 2
+        
+        except Exception as e:
+            logger.error(f"Ошибка при взаимодействии с Gemini API: {e}", exc_info=True)
+            return None
+
+    return None
