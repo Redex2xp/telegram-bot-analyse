@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
@@ -18,6 +19,44 @@ logger = logging.getLogger(__name__)
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
+
+
+async def swap_video_id_to_creator_id(query: str) -> str:
+    """
+    Функция ищет UUID в запросе, проверяет, является ли он ID видео,
+    и если да, заменяет его на ID креатора.
+    """
+    # Ищем UUID в запросе
+    match = re.search(r'([a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12})', query)
+    if not match:
+        return query
+
+    entity_id_str = match.group(1)
+    logger.info(f"Найден UUID: {entity_id_str}")
+
+    db_conn = await get_db_connection()
+    if db_conn is None:
+        logger.error("Не удалось подключиться к базе данных для проверки ID.")
+        return query  # Возвращаем исходный запрос, если нет подключения
+
+    try:
+        # Ищем видео
+        creator_id_from_video = await execute_query(db_conn, f"SELECT creator_id FROM videos WHERE id = '{entity_id_str}'")
+        if creator_id_from_video:
+            logger.info(f"UUID является ID видео. Найден ID креатора: {creator_id_from_video}")
+            # Заменяем ID видео на ID креатора в запросе
+            return query.replace(entity_id_str, str(creator_id_from_video))
+        
+        # Если не является ID видео, то предполагаем, что это ID креатора или не имеет отношения к видео/креаторам
+        logger.info("Найденный UUID не является ID видео. Предполагаем, что это ID креатора или не относится к видео.")
+
+    except Exception as e:
+        logger.error(f"Ошибка при проверке ID: {e}", exc_info=True)
+    finally:
+        if db_conn:
+            await db_conn.close()
+
+    return query
 
 
 @dp.message(CommandStart())
@@ -39,19 +78,26 @@ async def handle_query(message: types.Message):
     Основной обработчик для текстовых запросов пользователя.
 
     1. Получает текстовый запрос.
-    2. Отправляет запрос к LLM для генерации SQL.
-    3. Выполняет SQL-запрос к базе данных.
-    4. Отправляет результат пользователю.
+    2. Проверяет UUID и при необходимости заменяет video_id на creator_id.
+    3. Отправляет запрос к LLM для генерации SQL.
+    4. Выполняет SQL-запрос к базе данных.
+    5. Отправляет результат пользователю.
     """
     user_query = message.text
     logger.info(f"Получен новый запрос от пользователя: {user_query}")
 
-    await message.answer("Думаю над вашим вопросом...")
+
 
     try:
-        sql_query = await get_sql_from_llm(user_query)
-        if not sql_query:
-            await message.answer("Не удалось сгенерировать SQL-запрос. Попробуйте переформулировать вопрос.")
+        # Шаг 2: Проверка и замена ID
+        modified_query = await swap_video_id_to_creator_id(user_query)
+        if modified_query != user_query:
+            logger.info(f"Запрос был изменен: {modified_query}")
+
+        # 1. Получение SQL от LLM
+        sql_query = await get_sql_from_llm(modified_query)  # Используем измененный запрос
+        if not sql_query or sql_query == "ERROR":
+            await message.answer("Не удалось понять ваш запрос или сгенерировать SQL. Попробуйте переформулировать его.")
             return
 
         logger.info(f"Сгенерирован SQL-запрос: {sql_query}")
@@ -67,7 +113,7 @@ async def handle_query(message: types.Message):
         logger.info(f"Результат выполнения запроса: {result}")
 
         if result is not None:
-            await message.answer(f"Ответ: {result}")
+            await message.answer(f"{result}")
         else:
             await message.answer("Не удалось получить результат. Возможно, запрос некорректен или данные отсутствуют.")
 

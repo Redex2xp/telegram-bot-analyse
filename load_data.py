@@ -61,7 +61,7 @@ async def load_data():
         videos_to_insert = []
         snapshots_to_insert = []
 
-        for video_data in data:
+        for video_data in data.get('videos', []):
             video_id = uuid.UUID(video_data['id'])
     
             videos_to_insert.append((
