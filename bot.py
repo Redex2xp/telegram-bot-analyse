@@ -26,7 +26,6 @@ async def swap_video_id_to_creator_id(query: str) -> str:
     Функция ищет UUID в запросе, проверяет, является ли он ID видео,
     и если да, заменяет его на ID креатора.
     """
-    # Ищем UUID в запросе
     match = re.search(r'([a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12})', query)
     if not match:
         return query
@@ -37,17 +36,14 @@ async def swap_video_id_to_creator_id(query: str) -> str:
     db_conn = await get_db_connection()
     if db_conn is None:
         logger.error("Не удалось подключиться к базе данных для проверки ID.")
-        return query  # Возвращаем исходный запрос, если нет подключения
+        return query 
 
     try:
-        # Ищем видео
         creator_id_from_video = await execute_query(db_conn, f"SELECT creator_id FROM videos WHERE id = '{entity_id_str}'")
         if creator_id_from_video:
             logger.info(f"UUID является ID видео. Найден ID креатора: {creator_id_from_video}")
-            # Заменяем ID видео на ID креатора в запросе
             return query.replace(entity_id_str, str(creator_id_from_video))
         
-        # Если не является ID видео, то предполагаем, что это ID креатора или не имеет отношения к видео/креаторам
         logger.info("Найденный UUID не является ID видео. Предполагаем, что это ID креатора или не относится к видео.")
 
     except Exception as e:
@@ -89,13 +85,11 @@ async def handle_query(message: types.Message):
 
 
     try:
-        # Шаг 2: Проверка и замена ID
         modified_query = await swap_video_id_to_creator_id(user_query)
         if modified_query != user_query:
             logger.info(f"Запрос был изменен: {modified_query}")
 
-        # 1. Получение SQL от LLM
-        sql_query = await get_sql_from_llm(modified_query)  # Используем измененный запрос
+        sql_query = await get_sql_from_llm(modified_query)
         if not sql_query or sql_query == "ERROR":
             await message.answer("Не удалось понять ваш запрос или сгенерировать SQL. Попробуйте переформулировать его.")
             return
