@@ -2,6 +2,10 @@ import os
 import google.generativeai as genai
 from dotenv import load_dotenv
 import logging
+import time
+import asyncio
+from collections import deque
+from functools import wraps
 
 load_dotenv()
 
@@ -12,6 +16,41 @@ logger = logging.getLogger(__name__)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
+
+
+def rate_limit(calls: int, period: int):
+    """
+    Декоратор для ограничения частоты вызовов функции.
+
+    Args:
+        calls (int): Максимальное количество вызовов.
+        period (int): Временной период в секундах.
+    """
+    def decorator(func):
+        if not hasattr(rate_limit, "timestamps"):
+            rate_limit.timestamps = {}
+        
+        func_id = id(func)
+        if func_id not in rate_limit.timestamps:
+            rate_limit.timestamps[func_id] = deque(maxlen=calls)
+
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            timestamps = rate_limit.timestamps[func_id]
+            
+            if len(timestamps) >= calls:
+                oldest_timestamp = timestamps[0]
+                time_since_oldest = time.monotonic() - oldest_timestamp
+                
+                if time_since_oldest < period:
+                    wait_time = period - time_since_oldest
+                    logger.info(f"Превышен лимит запросов. Ожидание: {wait_time:.2f} сек.")
+                    await asyncio.sleep(wait_time)
+            
+            timestamps.append(time.monotonic())
+            return await func(*args, **kwargs)
+        return wrapper
+    return decorator
 
 
 PROMPT_TEMPLATE = """
@@ -61,6 +100,7 @@ def get_schema():
         logger.error("Файл схемы 'sql/init.sql' не найден.")
         return ""
 
+@rate_limit(5, 60)
 async def get_sql_from_llm(user_query: str) -> str | None:
     """
     Функция отправляет запрос к Gemini для преобразования текста в SQL.
