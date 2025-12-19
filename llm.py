@@ -1,58 +1,15 @@
 import os
-import google.generativeai as genai
+import httpx
 from dotenv import load_dotenv
 import logging
-import time
 import asyncio
-from collections import deque
-from functools import wraps
-from google.api_core.exceptions import ResourceExhausted
 
 load_dotenv()
 
-
 logger = logging.getLogger(__name__)
 
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-
-
-def rate_limit(calls: int, period: int):
-    """
-    Декоратор для ограничения частоты вызовов функции.
-
-    Args:
-        calls (int): Максимальное количество вызовов.
-        period (int): Временной период в секундах.
-    """
-    def decorator(func):
-        if not hasattr(rate_limit, "timestamps"):
-            rate_limit.timestamps = {}
-        
-        func_id = id(func)
-        if func_id not in rate_limit.timestamps:
-            rate_limit.timestamps[func_id] = deque(maxlen=calls)
-
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            timestamps = rate_limit.timestamps[func_id]
-            
-            if len(timestamps) >= calls:
-                oldest_timestamp = timestamps[0]
-                time_since_oldest = time.monotonic() - oldest_timestamp
-                
-                if time_since_oldest < period:
-                    wait_time = period - time_since_oldest
-                    logger.info(f"Превышен лимит запросов. Ожидание: {wait_time:.2f} сек.")
-                    await asyncio.sleep(wait_time)
-            
-            timestamps.append(time.monotonic())
-            return await func(*args, **kwargs)
-        return wrapper
-    return decorator
-
+# Загрузка ключа API из переменных окружения
+AGENTPLATFORM_KEY = os.getenv("AGENTPLATFORM_KEY")
 
 PROMPT_TEMPLATE = """
 Ты — продвинутый AI-ассистент, который преобразует запросы на естественном языке в SQL-запросы для базы данных PostgreSQL.
@@ -101,11 +58,10 @@ def get_schema():
         logger.error("Файл схемы 'sql/init.sql' не найден.")
         return ""
 
-@rate_limit(20, 60)
 async def get_sql_from_llm(user_query: str, max_retries: int = 3, initial_backoff: float = 5.0) -> str | None:
     """
-    Функция отправляет запрос к Gemini для преобразования текста в SQL.
-    Включает механизм повторных попыток с экспоненциальной задержкой.
+    Функция отправляет запрос к LLM API для преобразования текста в SQL.
+    Использует httpx для асинхронных запросов и включает механизм повторных попыток.
 
     Args:
         user_query (str): Запрос пользователя на естественном языке.
@@ -115,46 +71,64 @@ async def get_sql_from_llm(user_query: str, max_retries: int = 3, initial_backof
     Returns:
         str | None: Сгенерированный SQL-запрос или None в случае ошибки.
     """
-    if not GEMINI_API_KEY:
-        logger.error("API-ключ для Gemini не найден. Проверьте .env файл.")
+    if not AGENTPLATFORM_KEY:
+        logger.error("Ключ API AGENTPLATFORM_KEY не найден. Проверьте .env файл.")
         return None
 
+    schema = get_schema()
+    if not schema:
+        return None
+    
+    prompt = PROMPT_TEMPLATE.format(schema=schema, user_query=user_query)
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {AGENTPLATFORM_KEY}"
+    }
+    
+    data = {
+        "model": "openai/gpt-4o",
+        "messages": [{"role": "user", "content": prompt}]
+    }
+    
+    url = "https://litellm.tokengate.ru/v1/chat/completions"
+    
     attempt = 0
     backoff = initial_backoff
-    while attempt <= max_retries:
-        try:
-            model = genai.GenerativeModel('gemini-2.5-flash')
-            
-            schema = get_schema()
-            if not schema:
-                return None
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        while attempt <= max_retries:
+            try:
+                response = await client.post(url, headers=headers, json=data)
+                response.raise_for_status()  # Вызовет исключение для статусов 4xx/5xx
                 
-            prompt = PROMPT_TEMPLATE.format(schema=schema, user_query=user_query)
-            
-            response = await model.generate_content_async(prompt)
-            
-            sql_query = response.text.strip()
-            if sql_query.lower().startswith("```sql"):
-                sql_query = sql_query[5:]
-            if sql_query.endswith("```"):
-                sql_query = sql_query[:-3]
-            if sql_query.endswith(';'):
-                sql_query = sql_query[:-1]
+                result = response.json()
+                sql_query = result['choices'][0]['message']['content'].strip()
 
-            return sql_query.strip()
+                if sql_query.lower().startswith("```sql"):
+                    sql_query = sql_query[5:]
+                if sql_query.endswith("```"):
+                    sql_query = sql_query[:-3]
+                if sql_query.endswith(';'):
+                    sql_query = sql_query[:-1]
 
-        except ResourceExhausted as e:
-            if attempt == max_retries:
-                logger.error(f"Достигнуто максимальное количество повторных попыток. Ошибка API: {e}", exc_info=True)
+                return sql_query.strip()
+
+            except httpx.HTTPStatusError as e:
+                logger.error(f"Ошибка API (статус {e.response.status_code}): {e.response.text}", exc_info=True)
+                if e.response.status_code in [429, 500, 502, 503, 504]: # Ошибки, при которых стоит повторить
+                    if attempt == max_retries:
+                        logger.error("Достигнуто максимальное количество повторных попыток.")
+                        return None
+                    
+                    logger.warning(f"Попытка {attempt + 1} из {max_retries}. Ожидание {backoff:.2f} сек.")
+                    await asyncio.sleep(backoff)
+                    attempt += 1
+                    backoff *= 2
+                else: # Нерешаемые ошибки клиента
+                    return None
+
+            except Exception as e:
+                logger.error(f"Непредвиденная ошибка при взаимодействии с API: {e}", exc_info=True)
                 return None
-            
-            logger.warning(f"Превышена квота API. Попытка {attempt + 1} из {max_retries}. Ожидание {backoff:.2f} сек.")
-            await asyncio.sleep(backoff)
-            attempt += 1
-            backoff *= 2
-        
-        except Exception as e:
-            logger.error(f"Ошибка при взаимодействии с Gemini API: {e}", exc_info=True)
-            return None
 
     return None
