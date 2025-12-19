@@ -8,7 +8,6 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# Загрузка ключа API из переменных окружения
 AGENTPLATFORM_KEY = os.getenv("AGENTPLATFORM_KEY")
 
 PROMPT_TEMPLATE = """
@@ -87,7 +86,7 @@ async def get_sql_from_llm(user_query: str, max_retries: int = 3, initial_backof
     }
     
     data = {
-        "model": "openai/gpt-4o",
+        "model": "google/gemini-2.5-flash-lite",
         "messages": [{"role": "user", "content": prompt}]
     }
     
@@ -99,7 +98,7 @@ async def get_sql_from_llm(user_query: str, max_retries: int = 3, initial_backof
         while attempt <= max_retries:
             try:
                 response = await client.post(url, headers=headers, json=data)
-                response.raise_for_status()  # Вызовет исключение для статусов 4xx/5xx
+                response.raise_for_status()
                 
                 result = response.json()
                 sql_query = result['choices'][0]['message']['content'].strip()
@@ -115,7 +114,7 @@ async def get_sql_from_llm(user_query: str, max_retries: int = 3, initial_backof
 
             except httpx.HTTPStatusError as e:
                 logger.error(f"Ошибка API (статус {e.response.status_code}): {e.response.text}", exc_info=True)
-                if e.response.status_code in [429, 500, 502, 503, 504]: # Ошибки, при которых стоит повторить
+                if e.response.status_code in [429, 500, 502, 503, 504]:
                     if attempt == max_retries:
                         logger.error("Достигнуто максимальное количество повторных попыток.")
                         return None
@@ -124,7 +123,7 @@ async def get_sql_from_llm(user_query: str, max_retries: int = 3, initial_backof
                     await asyncio.sleep(backoff)
                     attempt += 1
                     backoff *= 2
-                else: # Нерешаемые ошибки клиента
+                else:
                     return None
 
             except Exception as e:
